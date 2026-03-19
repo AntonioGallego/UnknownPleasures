@@ -1,0 +1,459 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>CP 1919 — Pulsar Ridgeline</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Courier+Prime&display=swap');
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    background: #000;
+    color: #fff;
+    font-family: 'Courier Prime', monospace;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    min-height: 100vh;
+    overflow: hidden;
+    user-select: none;
+  }
+
+  #container {
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 20px;
+  }
+
+  canvas { display: block; }
+
+  .controls {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    opacity: 0.6;
+    transition: opacity 0.3s;
+    flex-wrap: wrap;
+    justify-content: center;
+  }
+  .controls:hover { opacity: 1; }
+
+  .btn {
+    background: none;
+    border: 1px solid #fff;
+    color: #fff;
+    font-family: 'Courier Prime', monospace;
+    font-size: 12px;
+    padding: 5px 14px;
+    cursor: pointer;
+    letter-spacing: 2px;
+    text-transform: uppercase;
+    transition: all 0.2s;
+  }
+  .btn:hover { background: #fff; color: #000; }
+  .btn.active { background: #fff; color: #000; }
+
+  .toggle-group { display: flex; }
+  .toggle-group .btn { border-radius: 0; }
+  .toggle-group .btn:first-child { border-right: none; }
+
+  .title {
+    font-size: 10px;
+    letter-spacing: 6px;
+    text-transform: uppercase;
+    opacity: 0.25;
+    margin-top: 4px;
+  }
+
+  .mic-notice {
+    position: fixed;
+    bottom: 16px;
+    font-size: 10px;
+    letter-spacing: 2px;
+    opacity: 0;
+    transition: opacity 0.5s;
+    text-transform: uppercase;
+  }
+  .mic-notice.visible { opacity: 0.35; }
+</style>
+</head>
+<body>
+
+<div id="container">
+  <canvas id="canvas"></canvas>
+  <div class="controls">
+    <button class="btn" id="playBtn">Start</button>
+    <div class="toggle-group">
+      <button class="btn active" id="synthBtn">Sequencer</button>
+      <button class="btn" id="micBtn">Mic</button>
+    </div>
+  </div>
+  <div class="title">CP 1919 — Pulsar Radio Emissions</div>
+</div>
+
+<div class="mic-notice" id="micNotice">Microphone active</div>
+
+<script>
+(function() {
+  const canvas = document.getElementById('canvas');
+  const ctx = canvas.getContext('2d');
+
+  const BASE_W = 600;
+  const BASE_H = 720;
+  const NUM_LINES = 80;
+  const SAMPLES = 256;
+
+  // ---- Declare all state BEFORE resize/draw ----
+  var sc = 1;
+  var running = false;
+  var mode = 'synth';
+  var lines = [];
+  var analyser = null;
+  var timeDomain = null;
+  var micStream = null;
+  var micSource = null;
+  var toneLoaded = false;
+  var audioCtx = null;
+  var seqParts = [];
+  var seqDisposables = [];
+  var lastCapture = 0;
+  var CAPTURE_MS = 95;
+
+  // ---- Sizing ----
+  function resize() {
+    var maxW = window.innerWidth * 0.88;
+    var maxH = window.innerHeight * 0.80;
+    sc = Math.min(maxW / BASE_W, maxH / BASE_H, 1);
+    canvas.width = Math.floor(BASE_W * sc);
+    canvas.height = Math.floor(BASE_H * sc);
+    draw();
+  }
+  resize();
+  window.addEventListener('resize', resize);
+
+  // ---- UI ----
+  var playBtn = document.getElementById('playBtn');
+  var synthBtn = document.getElementById('synthBtn');
+  var micBtn = document.getElementById('micBtn');
+  var micNotice = document.getElementById('micNotice');
+
+  playBtn.addEventListener('click', togglePlay);
+  synthBtn.addEventListener('click', function() { setMode('synth'); });
+  micBtn.addEventListener('click', function() { setMode('mic'); });
+
+  function togglePlay() {
+    running ? stop() : start();
+  }
+
+  // ---- Load Tone.js on demand (after user gesture) ----
+  function loadTone(callback) {
+    if (toneLoaded) { callback(); return; }
+    var s = document.createElement('script');
+    s.src = 'https://cdnjs.cloudflare.com/ajax/libs/tone/14.8.49/Tone.js';
+    s.onload = function() {
+      toneLoaded = true;
+      callback();
+    };
+    s.onerror = function() {
+      console.error('Failed to load Tone.js');
+    };
+    document.head.appendChild(s);
+  }
+
+  async function start() {
+    running = true;
+    playBtn.textContent = 'Stop';
+    playBtn.classList.add('active');
+    lines = [];
+
+    if (mode === 'synth') {
+      loadTone(async function() {
+        await Tone.start();
+        setupAnalyser();
+        startSequencer();
+        requestAnimationFrame(loop);
+      });
+    } else {
+      // Mic mode — use raw Web Audio API, no Tone needed
+      if (!audioCtx) {
+        audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      }
+      if (audioCtx.state === 'suspended') await audioCtx.resume();
+      setupAnalyserRaw();
+      await startMic();
+      requestAnimationFrame(loop);
+    }
+  }
+
+  function stop() {
+    running = false;
+    playBtn.textContent = 'Start';
+    playBtn.classList.remove('active');
+    stopSequencer();
+    stopMic();
+    micNotice.classList.remove('visible');
+  }
+
+  function setMode(m) {
+    mode = m;
+    synthBtn.classList.toggle('active', m === 'synth');
+    micBtn.classList.toggle('active', m === 'mic');
+    micNotice.classList.toggle('visible', m === 'mic' && running);
+    if (running) {
+      stop();
+      start();
+    }
+  }
+
+  // ---- Analyser setup ----
+  function setupAnalyser() {
+    analyser = Tone.context.createAnalyser();
+    analyser.fftSize = 1024;
+    timeDomain = new Uint8Array(analyser.fftSize);
+  }
+
+  function setupAnalyserRaw() {
+    analyser = audioCtx.createAnalyser();
+    analyser.fftSize = 1024;
+    timeDomain = new Uint8Array(analyser.fftSize);
+  }
+
+  // ============================================================
+  //  ATMOSPHERIC SEQUENCER (Tone.js)
+  // ============================================================
+
+  function startSequencer() {
+    var rev = new Tone.Reverb({ decay: 5, wet: 0.5 }).toDestination();
+    var delay = new Tone.FeedbackDelay({ delayTime: '8n.', feedback: 0.3, wet: 0.25 }).connect(rev);
+    var masterGain = new Tone.Gain(0.75).connect(delay);
+
+    // Connect destination to analyser for visualization
+    Tone.getDestination().connect(analyser);
+
+    // --- Sub bass drone ---
+    var bass = new Tone.MonoSynth({
+      oscillator: { type: 'sine' },
+      envelope: { attack: 1.2, decay: 0.4, sustain: 0.7, release: 2 },
+      filterEnvelope: { attack: 0.8, decay: 0, sustain: 1, release: 2, baseFrequency: 50, octaves: 1.5 }
+    }).connect(masterGain);
+    bass.volume.value = -4;
+
+    var bassNotes = ['C1','D1','E1','G1','A1','C2'];
+    var bassPart = new Tone.Loop(function(time) {
+      var note = bassNotes[Math.floor(Math.random() * bassNotes.length)];
+      bass.triggerAttackRelease(note, '2n', time, 0.7 + Math.random() * 0.3);
+    }, '1.337');
+
+    // --- Melodic pings ---
+    var ping = new Tone.PolySynth(Tone.Synth, {
+      oscillator: { type: 'triangle' },
+      envelope: { attack: 0.005, decay: 0.5, sustain: 0, release: 1.0 }
+    }).connect(masterGain);
+    ping.volume.value = -8;
+
+    var pingNotes = ['E3','G3','A3','B3','D4','E4','G4','A4','B4'];
+    var pingPart = new Tone.Loop(function(time) {
+      if (Math.random() > 0.55) return;
+      var count = Math.floor(Math.random() * 3) + 1;
+      for (var i = 0; i < count; i++) {
+        var note = pingNotes[Math.floor(Math.random() * pingNotes.length)];
+        var off = i * (0.06 + Math.random() * 0.12);
+        ping.triggerAttackRelease(note, '16n', time + off, 0.12 + Math.random() * 0.2);
+      }
+    }, '0.668');
+
+    // --- Noise bursts ---
+    var noise = new Tone.NoiseSynth({
+      noise: { type: 'pink' },
+      envelope: { attack: 0.002, decay: 0.06, sustain: 0 }
+    }).connect(masterGain);
+    noise.volume.value = -12;
+
+    var noisePart = new Tone.Loop(function(time) {
+      if (Math.random() > 0.35) return;
+      noise.triggerAttackRelease('32n', time);
+    }, '0.334');
+
+    // --- Shimmer ---
+    var shimmer = new Tone.Synth({
+      oscillator: { type: 'sine' },
+      envelope: { attack: 0.6, decay: 1.2, sustain: 0, release: 1.8 }
+    }).connect(masterGain);
+    shimmer.volume.value = -16;
+
+    var shimmerNotes = ['E5','G5','A5','B5','D6','E6'];
+    var shimmerPart = new Tone.Loop(function(time) {
+      if (Math.random() > 0.3) return;
+      var note = shimmerNotes[Math.floor(Math.random() * shimmerNotes.length)];
+      shimmer.triggerAttackRelease(note, '4n', time, 0.06 + Math.random() * 0.08);
+    }, '2.674');
+
+    // --- Deep hit ---
+    var hit = new Tone.MembraneSynth({
+      pitchDecay: 0.05,
+      octaves: 4,
+      envelope: { attack: 0.001, decay: 0.8, sustain: 0, release: 1.0 }
+    }).connect(masterGain);
+    hit.volume.value = -8;
+
+    var hitPart = new Tone.Loop(function(time) {
+      if (Math.random() > 0.2) return;
+      hit.triggerAttackRelease('C1', '8n', time, 0.5 + Math.random() * 0.3);
+    }, '2.674');
+
+    seqDisposables = [bass, ping, noise, shimmer, hit, rev, delay, masterGain];
+    seqParts = [bassPart, pingPart, noisePart, shimmerPart, hitPart];
+
+    Tone.Transport.bpm.value = 72;
+    seqParts.forEach(function(p) { p.start(0); });
+    Tone.Transport.start();
+  }
+
+  function stopSequencer() {
+    if (typeof Tone !== 'undefined') {
+      try { Tone.Transport.stop(); } catch(e) {}
+    }
+    seqParts.forEach(function(p) { try { p.stop(); p.dispose(); } catch(e){} });
+    seqDisposables.forEach(function(s) { try { s.dispose(); } catch(e){} });
+    seqParts = [];
+    seqDisposables = [];
+  }
+
+  // ============================================================
+  //  MICROPHONE (raw Web Audio)
+  // ============================================================
+
+  async function startMic() {
+    try {
+      micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      micSource = audioCtx.createMediaStreamSource(micStream);
+      micSource.connect(analyser);
+      micNotice.classList.add('visible');
+    } catch(e) {
+      console.warn('Mic denied', e);
+      setMode('synth');
+    }
+  }
+
+  function stopMic() {
+    if (micSource) { try { micSource.disconnect(); } catch(e){} micSource = null; }
+    if (micStream) { micStream.getTracks().forEach(function(t) { t.stop(); }); micStream = null; }
+  }
+
+  // ============================================================
+  //  WAVEFORM CAPTURE + WINDOWING
+  //  20% left taper | 60% center (boosted ×4) | 20% right taper
+  // ============================================================
+
+  function captureWaveform() {
+    if (!analyser || !timeDomain) return null;
+    analyser.getByteTimeDomainData(timeDomain);
+
+    var step = timeDomain.length / SAMPLES;
+    var wave = new Float32Array(SAMPLES);
+    for (var i = 0; i < SAMPLES; i++) {
+      var idx = Math.floor(i * step);
+      wave[i] = (timeDomain[idx] - 128) / 128;
+    }
+    return wave;
+  }
+
+  function applyWindow(wave) {
+    var N = wave.length;
+    var result = new Float32Array(N);
+    var edge = Math.floor(N * 0.20);
+    var centerBoost = 4.0;
+
+    for (var i = 0; i < N; i++) {
+      var g;
+      if (i < edge) {
+        // Left taper: cosine rise 0→1
+        var t = i / edge;
+        g = 0.5 * (1 - Math.cos(Math.PI * t));
+      } else if (i >= N - edge) {
+        // Right taper: cosine fall 1→0
+        var t2 = (N - 1 - i) / edge;
+        g = 0.5 * (1 - Math.cos(Math.PI * t2));
+      } else {
+        // Center 60%: boosted with gaussian peak at midpoint
+        var rel = (i - edge) / (N - 2 * edge);
+        var fromMid = rel - 0.5;
+        g = centerBoost * (1 + 0.6 * Math.exp(-fromMid * fromMid * 12));
+      }
+      result[i] = wave[i] * g;
+    }
+    return result;
+  }
+
+  // ============================================================
+  //  RENDER
+  // ============================================================
+
+  function loop(ts) {
+    if (!running) { draw(); return; }
+
+    if (ts - lastCapture > CAPTURE_MS) {
+      var raw = captureWaveform();
+      if (raw) {
+        lines.push(applyWindow(raw));
+        if (lines.length > NUM_LINES) lines.shift();
+      }
+      lastCapture = ts;
+    }
+    draw();
+    requestAnimationFrame(loop);
+  }
+
+  function draw() {
+    var w = canvas.width;
+    var h = canvas.height;
+    ctx.fillStyle = '#000';
+    ctx.fillRect(0, 0, w, h);
+
+    if (!lines || lines.length === 0) return;
+
+    var mx = 50 * sc;
+    var mt = 30 * sc;
+    var mb = 30 * sc;
+    var pw = w - mx * 2;
+    var ph = h - mt - mb;
+    var spacing = ph / NUM_LINES;
+    var amp = 48 * sc;
+
+    ctx.strokeStyle = '#fff';
+    ctx.lineWidth = 1.0 * sc;
+    ctx.lineJoin = 'round';
+
+    for (var li = 0; li < lines.length; li++) {
+      var wave = lines[li];
+      var baseY = mt + li * spacing;
+
+      ctx.beginPath();
+      ctx.moveTo(mx, baseY);
+
+      for (var i = 0; i < SAMPLES; i++) {
+        var x = mx + (i / (SAMPLES - 1)) * pw;
+        var y = baseY - wave[i] * amp;
+        ctx.lineTo(x, y);
+      }
+
+      ctx.lineTo(mx + pw, baseY);
+
+      ctx.fillStyle = '#000';
+      ctx.fill();
+      ctx.stroke();
+    }
+  }
+
+  // Initial draw (safe now — lines is already declared)
+  draw();
+
+})();
+</script>
+</body>
+</html>
